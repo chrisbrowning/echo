@@ -44,7 +44,7 @@ def main():
 def guess():
     reponse = ""
     current_idx = session.get('cc', 0)
-    input_text = request.form.get("user_input", "")
+    input_text = request.form.get("user_input", "")[0:20]
     answer = country_data[current_idx]['capitalCity']
     if input_text.lower() == answer.lower():
         return """
@@ -55,11 +55,11 @@ def guess():
         """.format(input_text)
     else:
         return """
-        Incorrect! The correct answer was {0} and you said {1}
+        Incorrect! The correct answer was {} and you said {}
         <form action="/">
             <button type="submit">Try again??</button>
         </form>
-        """.format(answer, user_input)
+        """.format(answer, input_text)
 
 def get_current_idx():
     return current_idx
