@@ -32,6 +32,7 @@ def main():
     rand_country = country_data[current_idx]['name']
     session['cc'] = current_idx
     return '''
+    <h4> Module 2 </h4>
     <h3> What is the capital of {0}?</h3>
      <form action="/guess" method="POST">
          <input name="user_input">
@@ -47,11 +48,11 @@ def guess():
     answer = country_data[current_idx]['capitalCity']
     if input_text.lower() == answer.lower():
         return """
-        Correct!
+        {0} is correct!
         <form action="/">
             <button type="submit">Try again??</button>
         </form>
-        """
+        """.format(input_text)
     else:
         return """
         Incorrect! The correct answer was {0}
