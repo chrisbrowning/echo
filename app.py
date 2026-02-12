@@ -55,11 +55,11 @@ def guess():
         """.format(input_text)
     else:
         return """
-        Incorrect! The correct answer was {0}
+        Incorrect! The correct answer was {0} and you said {1}
         <form action="/">
             <button type="submit">Try again??</button>
         </form>
-        """.format(answer)
+        """.format(answer, user_input)
 
 def get_current_idx():
     return current_idx
