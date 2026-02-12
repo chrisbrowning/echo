@@ -45,7 +45,7 @@ def guess():
     current_idx = session.get('cc', 0)
     input_text = request.form.get("user_input", "")
     answer = country_data[current_idx]['capitalCity']
-    if input_text == answer:
+    if input_text.lower() == answer.lower():
         return """
         Correct!
         <form action="/">
