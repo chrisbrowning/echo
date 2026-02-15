@@ -8,6 +8,7 @@ import uuid
 import sqlite3
 import re
 import os
+from waitress import serve
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SESSION_SECRET')
@@ -75,7 +76,7 @@ except Exception as e:
     print(f"Unexpected exception: {e}")
 
 @app.route("/")
-def main():
+def entry():
     new_session = False
     if 'id' not in session:
         session['id'] = str(uuid.uuid4())
@@ -209,3 +210,6 @@ def reset_results():
 # strip punctuation, whitespaces, and convert to lowercase
 def sanitize(text):
     return re.sub(r'[^\w]', '', text).lower()
+
+def run():
+    serve(app, host="0.0.0.0", port=8080)
