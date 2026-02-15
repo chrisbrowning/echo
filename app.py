@@ -4,62 +4,208 @@ from flask import Flask, request, session
 import random
 import requests
 import json
+import uuid
+import sqlite3
+import re
+import os
 
 app = Flask(__name__)
-app.secret_key = "1239075612312312"
+app.secret_key = os.getenv('SESSION_SECRET')
 
-curr_page = 0
-pages = 1
-country_data = []
+# Uses the World Bank API to hydrate a DB of country data
+# If a country already exists, it will be ignored during the insert
+# In the unlikely event that a new country comes to exist in the world, it will be inserted :)
 
-while curr_page <= pages:
-    next_url = f"https://api.worldbank.org/v2/country?format=json&page={curr_page + 1}"
-    r = requests.get(next_url)
-    payload = json.loads(r.text)
-    curr_page = payload[0]['page']
-    pages = payload[0]['pages']
-    content = payload[1]
-    for c in content:
-        if c['capitalCity'] is None or c['capitalCity'] == "":
-            continue
-        country_data.append(c)
-    
-current_idx = 0
+db_file = "app.db"
+try:
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS countries (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                region TEXT NOT NULL,
+                capitalCity TEXT NOT NULL
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS results (
+                timestamp TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                country TEXT NOT NULL,
+                region TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                credited INTEGER NOT NULL
+            )
+        ''')
+
+        country_data = []
+        cursor.execute('''
+            SELECT * FROM countries
+        ''')
+        countries = cursor.fetchall()
+        # Check if we already have country data before pulling from the API
+        if len(country_data) > 0:
+            for country in countries:
+                country_data.append((country[0],country[1],country[2],country[3]))
+        else:
+            curr_page = 0
+            pages = 1
+            country_data = []
+
+            while curr_page <= pages:
+                next_url = f"https://api.worldbank.org/v2/country?format=json&page={curr_page + 1}"
+                r = requests.get(next_url)
+                payload = json.loads(r.text)
+                curr_page = payload[0]['page']
+                pages = payload[0]['pages']
+                content = payload[1]
+                for c in content:
+                    if c['capitalCity'] is None or c['capitalCity'] == "":
+                        continue
+                    country_data.append((c['id'], c['name'], c['region']['value'], c['capitalCity']))
+
+            cursor.executemany("INSERT OR IGNORE INTO countries (id, name, region, capitalCity) VALUES (?, ?, ?, ?)", country_data)
+            print(f"Inserted {cursor.rowcount} records into 'countries'.")
+
+except Exception as e:
+    print(f"Unexpected exception: {e}")
 
 @app.route("/")
 def main():
+    new_session = False
+    if 'id' not in session:
+        session['id'] = str(uuid.uuid4())
+        new_session = True
     current_idx = random.randrange(len(country_data))
-    rand_country = country_data[current_idx]['name']
+    rand_country = country_data[current_idx][1]
     session['cc'] = current_idx
-    return '''
-    <h4> Module 2 </h4>
-    <h3> What is the capital of {0}?</h3>
-     <form action="/guess" method="POST">
-         <input name="user_input">
-         <input type="submit" value="Submit!">
-     </form>
-     '''.format(rand_country)
+    if new_session:
+        return '''
+        <h3> Final Exam </h3>
+        <h3> What is the capital of {0}?</h3>
+        <form action="/guess" method="POST">
+            <input name="user_input">
+            <input type="submit" value="Submit!">
+        </form>
+        <h5> Note: Answers ignore spaces, punctuation, and case </h5>
+        <h5> Data for this quiz provided by the World Bank</h5>
+        '''.format(rand_country)
+    else:
+        pct_correct = analyze_results(session['id'])
+        pct_correct_html = ""
+        for item in pct_correct:
+            pct_correct_html = pct_correct_html + f"<tr>\n <td>{item[0]}</td><td> {item[1]*100}% </td><td>   </td><td>{item[3]} out of {item[2]}</td></tr>\n"
+        return '''
+        <h3> Final Exam </h3>
+        <break>
+        <h4> Session Performance</h4>
+        <table>
+        <tr><td>Region</td><td> Correct </td><td>   </td><td>Rank</td></tr>
+        {0}
+        </table>
+        <break>
+        <h3> What is the capital of {1}?</h3>
+        <form action="/guess" method="POST">
+            <input name="user_input">
+            <input type="submit" value="Submit!">
+        </form>
+        <h5> Note: Answers ignore spacing, punctuation, and case </h5>
+        <form action="/reset" method="POST">
+            <button type="submit">Reset Session History?</button>
+        </form>
+        <h5> Data for this quiz provided by the World Bank</h5>
+        '''.format(pct_correct_html, rand_country)
 
 @app.route("/guess", methods=["POST"])
 def guess():
     reponse = ""
     current_idx = session.get('cc', 0)
     input_text = request.form.get("user_input", "")[0:20]
-    answer = country_data[current_idx]['capitalCity']
-    if input_text.lower() == answer.lower():
+    answer = country_data[current_idx][3]
+    credited = sanitize(input_text) == sanitize(answer)
+    register_result(session['id'], request.remote_addr, country_data[current_idx][1], country_data[current_idx][2], answer, credited)
+    if credited:
         return """
-        {0} is correct!
+        {0} is correct
         <form action="/">
-            <button type="submit">Try again??</button>
+            <button type="submit">Continue?</button>
         </form>
-        """.format(input_text)
+        """.format(answer)
     else:
         return """
-        Incorrect! The correct answer was {} and you said {}
+        Incorrect. The correct answer was {} and you said {}
         <form action="/">
-            <button type="submit">Try again??</button>
+            <button type="submit">Continue?</button>
         </form>
         """.format(answer, input_text)
 
 def get_current_idx():
     return current_idx
+
+def register_result(session_id, ip, country, region, answer, credited):
+    try:
+        with sqlite3.connect(db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO results (timestamp, session_id, ip, country, region, answer, credited) 
+                VALUES (CURRENT_TIMESTAMP,?,?,?,?,?,?)
+            ''', (session_id, ip, country, region, answer, credited))   
+            print(f"{ip} {session_id} {country} {credited}")
+
+    except Exception as e:
+        print(f"Unexpected exception: {e}")
+
+def analyze_results(session_id):
+    pct_correct = []
+    try:
+        with sqlite3.connect(db_file) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+            SELECT region, pct, outof, place
+            FROM (
+                SELECT session_id, priority, region, pct, COUNT(session_id) OVER (PARTITION BY region) as outof, rank() OVER win1 as place
+                FROM (
+                    SELECT session_id, 100 as priority, 'Overall' as region, SUM(credited) as total_credited, COUNT(*) as total_answered, CAST(SUM(credited) AS REAL) / COUNT(*) AS pct 
+                    FROM results
+                    GROUP BY session_id
+                    UNION ALL
+                    SELECT session_id, 0 as priority, region, SUM(credited) as total_credited, COUNT(*) as total_answered, CAST(SUM(credited) AS REAL) / COUNT(*) as pct
+                    FROM results
+                    GROUP BY session_id, region
+                ) AS agg
+                WINDOW win1 AS (PARTITION BY region ORDER BY pct DESC)
+            ) as aggtwo
+            WHERE session_id = ?
+            ORDER BY priority desc
+            """, (session_id,))
+            pct_correct = cursor.fetchall()
+    except Exception as e:
+        print(f"Unexpected exception: {e}")
+    return pct_correct
+
+@app.route("/reset", methods=["POST"]) 
+def reset_results():
+    try:
+        with sqlite3.connect(db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            DELETE from results
+            WHERE session_id = ?
+            """, (session['id'],))
+    except Exception as e:
+        print(f"Unexpected exception: {e}")
+    return """
+    Results reset successfully.
+    <form action="/">
+        <button type="submit">Start Over?</button>
+    </form>     
+    """
+
+# strip punctuation, whitespaces, and convert to lowercase
+def sanitize(text):
+    return re.sub(r'[^\w]', '', text).lower()
