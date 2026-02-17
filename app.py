@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from flask import Flask, request, session
+from flask import Flask, request, session, jsonify
 import random
 import requests
 import json
@@ -13,67 +13,7 @@ from waitress import serve
 app = Flask(__name__)
 app.secret_key = os.getenv('SESSION_SECRET')
 
-# Uses the World Bank API to hydrate a DB of country data
-# If a country already exists, it will be ignored during the insert
-# In the unlikely event that a new country comes to exist in the world, it will be inserted :)
-
-db_file = "app.db"
-try:
-    with sqlite3.connect(db_file) as conn:
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS countries (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                region TEXT NOT NULL,
-                capitalCity TEXT NOT NULL
-            )
-        ''')
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS results (
-                timestamp TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                ip TEXT NOT NULL,
-                country TEXT NOT NULL,
-                region TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                credited INTEGER NOT NULL
-            )
-        ''')
-
-        country_data = []
-        cursor.execute('''
-            SELECT * FROM countries
-        ''')
-        countries = cursor.fetchall()
-        # Check if we already have country data before pulling from the API
-        if len(country_data) > 0:
-            for country in countries:
-                country_data.append((country[0],country[1],country[2],country[3]))
-        else:
-            curr_page = 0
-            pages = 1
-            country_data = []
-
-            while curr_page <= pages:
-                next_url = f"https://api.worldbank.org/v2/country?format=json&page={curr_page + 1}"
-                r = requests.get(next_url)
-                payload = json.loads(r.text)
-                curr_page = payload[0]['page']
-                pages = payload[0]['pages']
-                content = payload[1]
-                for c in content:
-                    if c['capitalCity'] is None or c['capitalCity'] == "":
-                        continue
-                    country_data.append((c['id'], c['name'], c['region']['value'], c['capitalCity']))
-
-            cursor.executemany("INSERT OR IGNORE INTO countries (id, name, region, capitalCity) VALUES (?, ?, ?, ?)", country_data)
-            print(f"Inserted {cursor.rowcount} records into 'countries'.")
-
-except Exception as e:
-    print(f"Unexpected exception: {e}")
+country_data = []
 
 @app.route("/")
 def entry():
@@ -123,7 +63,6 @@ def entry():
 
 @app.route("/guess", methods=["POST"])
 def guess():
-    reponse = ""
     current_idx = session.get('cc', 0)
     input_text = request.form.get("user_input", "")[0:20]
     answer = country_data[current_idx][3]
@@ -147,13 +86,16 @@ def guess():
 def get_current_idx():
     return current_idx
 
+def set_current_idx(idx):
+    session['cc'] = idx
+
 def register_result(session_id, ip, country, region, answer, credited):
     try:
-        with sqlite3.connect(db_file) as conn:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO results (timestamp, session_id, ip, country, region, answer, credited) 
-                VALUES (CURRENT_TIMESTAMP,?,?,?,?,?,?)
+                INSERT INTO results (session_id, ip, country, region, answer, credited) 
+                VALUES (?,?,?,?,?,?)
             ''', (session_id, ip, country, region, answer, credited))   
             print(f"{ip} {session_id} {country} {credited}")
 
@@ -161,11 +103,13 @@ def register_result(session_id, ip, country, region, answer, credited):
         print(f"Unexpected exception: {e}")
 
 def analyze_results(session_id):
-    pct_correct = []
+    user_results = []
     try:
-        with sqlite3.connect(db_file) as conn:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
             cursor = conn.cursor()
 
+            # this is complicated but I can't think of something more elegant
+            # for a given session_id, return the percent answered correctly and rank information per region (e.g. 1 out of 2)
             cursor.execute("""
             SELECT region, pct, outof, place
             FROM (
@@ -184,22 +128,14 @@ def analyze_results(session_id):
             WHERE session_id = ?
             ORDER BY priority desc
             """, (session_id,))
-            pct_correct = cursor.fetchall()
+            user_results = cursor.fetchall()
     except Exception as e:
         print(f"Unexpected exception: {e}")
-    return pct_correct
+    return user_results
 
 @app.route("/reset", methods=["POST"]) 
-def reset_results():
-    try:
-        with sqlite3.connect(db_file) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-            DELETE from results
-            WHERE session_id = ?
-            """, (session['id'],))
-    except Exception as e:
-        print(f"Unexpected exception: {e}")
+def reset():
+    reset_results(session["id"])
     return """
     Results reset successfully.
     <form action="/">
@@ -207,9 +143,126 @@ def reset_results():
     </form>     
     """
 
+def reset_results(session_id):
+    try:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            DELETE from results
+            WHERE session_id = ?
+            """, (session_id,))
+    except Exception as e:
+        print(f"Unexpected exception: {e}")    
+
 # strip punctuation, whitespaces, and convert to lowercase
 def sanitize(text):
     return re.sub(r'[^\w]', '', text).lower()
 
+@app.route("/metrics")
+def metrics():
+    return jsonify(get_metrics_past_day())
+
+def get_metrics_past_day():
+    metrics = {}
+    try:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+            """
+            SELECT COUNT(DISTINCT session_id) as sessions, COUNT(*) as questions_answered
+            FROM results
+            WHERE timestamp > DATETIME('now', '-1 day')
+            """)
+            results = cursor.fetchone()
+            metrics["sessions_24h"] = results[0]
+            metrics["total_answered_24h"] = results[1]
+            
+    except Exception as e:
+        print(f"Unexpected exception: {e}")      
+    return metrics   
+
+def init_ddl():
+    try:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS countries (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    capitalCity TEXT NOT NULL
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS results (
+                    timestamp TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                    session_id TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    country TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    credited INTEGER NOT NULL
+                )
+            ''')
+    except Exception as e:
+        print(f"Unexpected exception: {e}")
+
+
+def init_country_data():
+    try:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM countries
+            ''')
+            countries = cursor.fetchall()
+            # Check if we already have country data before pulling from the API
+            if len(country_data) > 0:
+                for country in countries:
+                    country_data.append((country[0],country[1],country[2],country[3]))
+            else:
+                curr_page = 0
+                pages = 1
+
+                while curr_page <= pages:
+                    next_url = f"https://api.worldbank.org/v2/country?format=json&page={curr_page + 1}"
+                    r = requests.get(next_url)
+                    payload = json.loads(r.text)
+                    curr_page = payload[0]['page']
+                    pages = payload[0]['pages']
+                    content = payload[1]
+                    for c in content:
+                        if c['capitalCity'] is None or c['capitalCity'] == "":
+                            continue
+                        country_data.append((c['id'], c['name'], c['region']['value'], c['capitalCity']))
+
+                cursor.executemany("INSERT OR IGNORE INTO countries (id, name, region, capitalCity) VALUES (?, ?, ?, ?)", country_data)
+                print(f"Inserted {cursor.rowcount} records into 'countries'.")
+    except Exception as e:
+        print(f"Unexpected exception: {e}")
+
+def set_country_data():
+    try:
+        with sqlite3.connect(app.config["DB_FILE"]) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM countries
+            ''')
+            countries = cursor.fetchall()
+            for country in countries:
+                country_data.append((country[0], country[1], country[2], country[3]))
+    except Exception as e:
+        print(f"Unexpected exception: {e}")    
+
+# Uses the World Bank API to hydrate a DB of country data
+# If a country already exists, it will be ignored during the insert
+# In the unlikely event that a new country comes to exist in the world, it will be inserted :)
+
 def run():
+    app.config.from_pyfile('app.cfg')
+    init_ddl()
+    init_country_data()
+    set_country_data()
     serve(app, host="0.0.0.0", port=8080)
