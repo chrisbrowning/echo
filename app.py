@@ -111,7 +111,7 @@ def analyze_results(session_id):
             # this is complicated but I can't think of something more elegant
             # for a given session_id, return the percent answered correctly and rank information per region (e.g. 1 out of 2)
             cursor.execute("""
-            SELECT region, pct, outof, place
+            SELECT region, round(pct, 2) as pct_rounded, outof, place
             FROM (
                 SELECT session_id, priority, region, pct, COUNT(session_id) OVER (PARTITION BY region) as outof, rank() OVER win1 as place
                 FROM (
